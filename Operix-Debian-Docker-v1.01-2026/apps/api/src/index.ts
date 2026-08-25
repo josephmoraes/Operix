@@ -5,6 +5,9 @@ import pg from 'pg';
 import {z} from 'zod';
 import {canReadAll,newRefresh,signAccess,verifyAccess,type Session,type Role} from './auth.js';
 import {canDecideTicket,canOperateWorkOrder,requireFinishFields} from './workflow.js';
+import {runSearch,searchQuerySchema,type SearchType} from './search.js';
+import {semanticRerank,semanticSearchEnabled} from './semantic-search.js';
+import {askNavigationAssistant,localNavigationAnswer,navigationScreens,type NavigationScreen} from './navigation-assistant.js';
 
 const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:20});
 const app=express(); app.disable('x-powered-by'); app.use(helmet()); app.use(cors({origin:process.env.APP_ORIGIN,credentials:true})); app.use(express.json({limit:'1mb'}));
@@ -26,6 +29,46 @@ app.get('/api/health',async(_req,res)=>{await pool.query('SELECT 1');res.json({s
 app.post('/api/auth/login',async(req,res)=>{const parsed=loginSchema.safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Dados de acesso invalidos'});const key=req.ip+parsed.data.email.toLowerCase();const state=attempts.get(key);if(state&&state.until>Date.now())return res.status(429).json({error:'Muitas tentativas. Aguarde alguns minutos.'});const q=await pool.query(`SELECT u.id,u.password_hash,u.must_change_password,p.full_name FROM users u JOIN people p ON p.id=u.person_id WHERE lower(u.email)=lower($1) AND u.active`,[parsed.data.email]);const user=q.rows[0];const ok=user&&(await pool.query('SELECT crypt($1,$2)=$2 ok',[parsed.data.password,user.password_hash])).rows[0].ok;if(!ok){const count=(state?.count??0)+1;attempts.set(key,{count,until:count>=5?Date.now()+15*60_000:0});return res.status(401).json({error:'E-mail ou senha incorretos'});}attempts.delete(key);const ms=await pool.query(`SELECT m.tenant_id "tenantId",t.name "tenantName",m.role,m.sector_id "sectorId" FROM memberships m JOIN tenants t ON t.id=m.tenant_id WHERE m.user_id=$1 AND m.active AND t.active ORDER BY t.name`,[user.id]);const first=ms.rows[0];const session:Session={sub:user.id,tenantId:first.tenantId,role:first.role,sectorId:first.sectorId,memberships:ms.rows};const accessToken=await signAccess(session);const refresh=newRefresh();await pool.query(`INSERT INTO refresh_tokens(user_id,token_hash,expires_at) VALUES($1,$2,now()+interval '7 days')`,[user.id,refresh.hash]);await pool.query(`INSERT INTO audit_logs(actor_user_id,action,entity_type,entity_id,ip) VALUES($1,'LOGIN','USER',$2,$3)`,[user.id,user.id,req.ip]);res.json({accessToken,refreshToken:refresh.raw,user:{name:user.full_name,mustChangePassword:user.must_change_password},memberships:ms.rows});});
 app.get('/api/dashboard',auth,tenant,async(req:any,res)=>{const s=req.scope;const data=await scoped(s.tenantId,async c=>{const visibility=canReadAll(s.role as Role)?'TRUE':'requester_id=(SELECT person_id FROM users WHERE id=$2)';const [counts,recent]=await Promise.all([c.query(`SELECT count(*) FILTER(WHERE status NOT IN ('CLOSED','CANCELLED'))::int open,count(*) FILTER(WHERE status='IN_PROGRESS')::int in_progress,count(*) FILTER(WHERE due_at<now() AND status NOT IN ('RESOLVED','CLOSED','CANCELLED'))::int overdue FROM tickets WHERE tenant_id=$1 AND ${visibility}`,[s.tenantId,req.session.sub]),c.query(`SELECT number,title,status,requested_at FROM tickets WHERE tenant_id=$1 AND ${visibility} ORDER BY requested_at DESC LIMIT 6`,[s.tenantId,req.session.sub])]);const assets=await c.query(`SELECT count(*)::int total FROM assets WHERE tenant_id=$1 AND status='ACTIVE'`,[s.tenantId]);return {tickets:counts.rows[0],assets:assets.rows[0].total,recent:recent.rows};});res.json(data);});
 app.get('/api/sectors',auth,tenant,async(req:any,res)=>{const rows=await scoped(req.scope.tenantId,async c=>(await c.query('SELECT id,name FROM sectors WHERE tenant_id=$1 AND active ORDER BY name',[req.scope.tenantId])).rows);res.json(rows);});
+app.get('/api/search',auth,tenant,async(req:any,res)=>{
+  const parsed=searchQuerySchema.safeParse(req.query);
+  if(!parsed.success)return res.status(400).json({error:'Informe uma busca com pelo menos 2 caracteres e tipos validos'});
+  const startedAt=Date.now();
+  const searchInput={
+    tenantId:req.scope.tenantId,
+    userId:req.session.sub,
+    role:req.scope.role as Role,
+    query:parsed.data.q,
+    limit:parsed.data.limit,
+    types:parsed.data.types as SearchType[]
+  };
+  let mode:'local'|'hybrid-ai'='local';
+  let results;
+  if(semanticSearchEnabled()){
+    try{
+      const candidates=await scoped(req.scope.tenantId,c=>runSearch(c,{
+        ...searchInput,
+        limit:Math.min(150,Math.max(60,parsed.data.limit*6)),
+        includeWeakMatches:true
+      }));
+      results=await semanticRerank(parsed.data.q,candidates,parsed.data.limit);
+      mode='hybrid-ai';
+    }catch(error){
+      console.warn('Busca semantica indisponivel; usando ranking local.',error instanceof Error?error.message:'erro desconhecido');
+    }
+  }
+  if(!results)results=await scoped(req.scope.tenantId,c=>runSearch(c,searchInput));
+  res.json({query:parsed.data.q,count:results.length,durationMs:Date.now()-startedAt,mode,results});
+});
+app.post('/api/assistant/navigation',auth,tenant,async(req:any,res)=>{
+  const parsed=z.object({message:z.string().trim().min(3).max(500),allowedScreens:z.array(z.enum(Object.keys(navigationScreens) as [NavigationScreen,...NavigationScreen[]])).min(1).max(20)}).safeParse(req.body);
+  if(!parsed.success)return res.status(400).json({error:'Explique o que você deseja fazer.'});
+  try{
+    res.json(await askNavigationAssistant(parsed.data.message,parsed.data.allowedScreens));
+  }catch(error){
+    console.warn('Assistente de navegacao indisponivel; usando orientacao local.',error instanceof Error?error.message:'erro desconhecido');
+    res.json(localNavigationAnswer(parsed.data.message,parsed.data.allowedScreens));
+  }
+});
 app.get('/api/tickets',auth,tenant,async(req:any,res)=>{const all=canReadAll(req.scope.role as Role);const rows=await scoped(req.scope.tenantId,async c=>(await c.query(`SELECT t.id,t.number,t.title,t.description,t.status,t.category,t.requested_at,t.requester_name,t.requester_extension,s.name sector_name FROM tickets t LEFT JOIN sectors s ON s.id=t.sector_id WHERE t.tenant_id=$1 AND ($3 OR t.requester_id=(SELECT person_id FROM users WHERE id=$2)) ORDER BY t.requested_at DESC`,[req.scope.tenantId,req.session.sub,all])).rows);res.json(rows);});
 app.post('/api/tickets',auth,tenant,async(req:any,res)=>{const body=z.object({sectorId:z.string().uuid(),request:z.string().min(10).max(5000),requesterName:z.string().min(3).max(160),extension:z.string().min(1).max(20),signatureKey:z.string().min(8).max(500),category:z.enum(['MAINTENANCE','IT']).default('MAINTENANCE')}).safeParse(req.body);if(!body.success)return res.status(400).json({error:'Preencha setor, solicitacao, nome, ramal e assinatura'});const d=body.data;const out=await scoped(req.scope.tenantId,async c=>{const pending=(await c.query(`SELECT 1 FROM work_orders w JOIN tickets t ON t.id=w.ticket_id JOIN users u ON u.person_id=t.requester_id WHERE w.tenant_id=$1 AND u.id=$2 AND w.status='AWAITING_REQUESTER' LIMIT 1`,[req.scope.tenantId,req.session.sub])).rowCount;if(pending)throw new Error('Avalie a ordem de servico finalizada antes de abrir um novo chamado');const valid=await c.query('SELECT 1 FROM sectors WHERE id=$1 AND tenant_id=$2 AND active',[d.sectorId,req.scope.tenantId]);if(!valid.rowCount)throw new Error('Setor invalido');const row=(await c.query(`INSERT INTO tickets(tenant_id,sector_id,requester_id,category,title,description,requester_name,requester_extension,requester_signature_key) SELECT $1,$2,person_id,$3,left($4,140),$4,$5,$6,$7 FROM users WHERE id=$8 RETURNING id,number,status`,[req.scope.tenantId,d.sectorId,d.category,d.request,d.requesterName,d.extension,d.signatureKey,req.session.sub])).rows[0];await c.query(`INSERT INTO audit_logs(tenant_id,actor_user_id,action,entity_type,entity_id,details) VALUES($1,$2,'TICKET_CREATED','TICKET',$3,$4)`,[req.scope.tenantId,req.session.sub,row.id,JSON.stringify({sectorId:d.sectorId})]);return row;});res.status(201).json(out);});
 app.post('/api/tickets/:id/deny',auth,tenant,technical,async(req:any,res)=>{const body=z.object({reason:z.string().min(10).max(2000),signatureKey:z.string().min(8).max(500)}).safeParse(req.body);if(!body.success)return res.status(400).json({error:'Informe a justificativa e assine a decisao'});const out=await scoped(req.scope.tenantId,async c=>{const person=(await c.query('SELECT person_id FROM users WHERE id=$1',[req.session.sub])).rows[0];const row=(await c.query(`UPDATE tickets SET status='CANCELLED',denial_reason=$1,decision_signature_key=$2,decision_at=now(),decided_by=$3 WHERE id=$4 AND tenant_id=$5 AND status IN ('NEW','TRIAGE') RETURNING id,number,status`,[body.data.reason,body.data.signatureKey,person.person_id,req.params.id,req.scope.tenantId])).rows[0];if(!row)throw new Error('Chamado nao esta disponivel para decisao');await c.query(`INSERT INTO audit_logs(tenant_id,actor_user_id,action,entity_type,entity_id,details) VALUES($1,$2,'TICKET_DENIED','TICKET',$3,$4)`,[req.scope.tenantId,req.session.sub,row.id,JSON.stringify({reason:body.data.reason})]);return row;});res.json(out);});

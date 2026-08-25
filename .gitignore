@@ -1,0 +1,7 @@
+.runtime/
+.pnpm-store/
+.env.local
+**/.env.local
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo

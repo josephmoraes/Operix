@@ -77,3 +77,25 @@ docker compose config
 ```
 
 Registre cada versão em um Pull Request e uma release do GitHub.
+
+## API de pesquisa
+
+A rota autenticada `GET /api/search` pesquisa dados da empresa selecionada e respeita o perfil do usuário.
+
+Parâmetros:
+
+- `q`: texto da pesquisa, entre 2 e 120 caracteres.
+- `limit`: quantidade de resultados, entre 1 e 50; o padrão é 20.
+- `types`: tipos separados por vírgula. Valores disponíveis: `ticket`, `work_order`, `asset`, `item` e `person`.
+
+Exemplo:
+
+```http
+GET /api/search?q=impressora%20quebrada&types=ticket,asset&limit=10
+Authorization: Bearer <token>
+X-Tenant-Id: <empresa-id>
+```
+
+Solicitantes encontram somente os próprios chamados e ordens. Perfis técnicos também pesquisam ativos e itens; dados de pessoas ficam restritos à administração.
+
+Quando `GEMINI_API_KEY` está configurada no ambiente da API, os resultados também são reordenados semanticamente com `gemini-embedding-001`. A pesquisa local continua disponível automaticamente caso o serviço externo esteja indisponível.
